@@ -88,11 +88,12 @@ trait RelationTrait
         $db = $this->getDb();
         $trans = $db->beginTransaction();
         $isNewRecord = $this->isNewRecord;
+        $relatedRecords = $this->relatedRecords;
         try {
             if ($this->save()) {
                 $error = false;
-                if (!empty($this->relatedRecords)) {
-                    foreach ($this->relatedRecords as $name => $records) {
+                if (!empty($relatedRecords)) {
+                    foreach ($relatedRecords as $name => $records) {
 
                         if (in_array($name, $skippedRelations))
                             continue;
