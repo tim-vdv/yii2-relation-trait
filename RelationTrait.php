@@ -9,14 +9,33 @@
 
 namespace mootensai\relation;
 
+use Yii;
+use yii\base\ErrorException;
 use yii\db\ActiveQuery;
 use \yii\db\ActiveRecord;
 use \yii\db\Exception;
+use yii\db\IntegrityException;
 use \yii\helpers\Inflector;
 use \yii\helpers\StringHelper;
+use yii\helpers\ArrayHelper;
 
 trait RelationTrait
 {
+    /* add this line to your Model to enable soft delete
+     *
+     * private $_rt_softdelete = ['<column>' => <deleted row marker value>];
+     * example :
+     * private $_rt_softdelete = ['isdeleted' => 1];
+     * or :
+     * private $_rt_softdelete = ['deleted_by' => Yii::app()->user->id]
+     * add this line to your Model to enable soft restore
+     * private $_rt_softrestore = ['<column>' => <undeleted row marker value];
+     * example :
+     * private $_rt_softrestore = ['isdeleted' => 0];
+     * or :
+     * private $_rt_softdelete = ['deleted_by' => 0];
+    */
+
     public function loadAll($POST, $skippedRelations = [])
     {
         if ($this->load($POST)) {
@@ -29,12 +48,13 @@ trait RelationTrait
                     /* @var $relObj ActiveRecord */
                     $isHasMany = is_array($value) && is_array(current($value));
                     $relName = ($isHasMany) ? lcfirst(Inflector::pluralize($key)) : lcfirst($key);
-                    
-                    if (in_array($relName, $skippedRelations) || !array_key_exists($relName,$relData)){
+
+                    if (in_array($relName, $skippedRelations) || !array_key_exists($relName, $relData)) {
                         continue;
                     }
-                    
+
                     $AQ = $this->getRelation($relName);
+                    /* @var $relModelClass ActiveRecord */
                     $relModelClass = $AQ->modelClass;
                     $relPKAttr = $relModelClass::primaryKey();
                     $isManyMany = count($relPKAttr) > 1;
@@ -46,8 +66,9 @@ trait RelationTrait
                                 $condition = [];
                                 $condition[$relPKAttr[0]] = $this->primaryKey;
                                 foreach ($relPost as $relAttr => $relAttrVal) {
-                                    if (in_array($relAttr, $relPKAttr))
+                                    if (in_array($relAttr, $relPKAttr)) {
                                         $condition[$relAttr] = $relAttrVal;
+                                    }
                                 }
                                 $relObj = $relModelClass::findOne($condition);
                                 if (is_null($relObj)) {
@@ -63,7 +84,10 @@ trait RelationTrait
                         foreach ($value as $relPost) {
                             if (array_filter($relPost)) {
                                 /* @var $relObj ActiveRecord */
-                                $relObj = (empty($relPost[$relPKAttr[0]])) ? new $relModelClass : $relModelClass::findOne($relPost[$relPKAttr[0]]);
+                                $relObj = (empty($relPost[$relPKAttr[0]])) ? new $relModelClass() : $relModelClass::findOne($relPost[$relPKAttr[0]]);
+                                if (is_null($relObj)) {
+                                    $relObj = new $relModelClass();
+                                }
                                 $relObj->load($relPost, '');
                                 $container[] = $relObj;
                             }
@@ -88,36 +112,35 @@ trait RelationTrait
         $db = $this->getDb();
         $trans = $db->beginTransaction();
         $isNewRecord = $this->isNewRecord;
-        $relatedRecords = $this->relatedRecords;
+        $isSoftDelete = isset($this->_rt_softdelete);
+	    $relatedRecords = $this->relatedRecords;
         try {
             if ($this->save()) {
                 $error = false;
-                if (!empty($relatedRecords)) {
-                    foreach ($relatedRecords as $name => $records) {
-
-                        if (in_array($name, $skippedRelations))
+                if (!empty($relatedRecords )) {
+                    /* @var $records ActiveRecord | ActiveRecord[] */
+                    foreach ($relatedRecords  as $name => $records) {
+                        if(in_array($name, $skippedRelations))
                             continue;
-
+                        
+                        $AQ = $this->getRelation($name);
+                        $link = $AQ->link;
                         if (!empty($records)) {
-                            $AQ = $this->getRelation($name);
-                            $link = $AQ->link;
                             $notDeletedPK = [];
+                            $notDeletedFK = [];
                             $relPKAttr = ($AQ->multiple) ? $records[0]->primaryKey() : $records->primaryKey();
                             $isManyMany = (count($relPKAttr) > 1);
                             if ($AQ->multiple) {
                                 /* @var $relModel ActiveRecord */
-                                $i = 0;
                                 foreach ($records as $index => $relModel) {
-                                    $notDeletedFK = [];
                                     foreach ($link as $key => $value) {
                                         $relModel->$key = $this->$value;
-                                        if ($isManyMany) $notDeletedFK[$key] = $this->$value;
-                                        elseif ($AQ->multiple) $notDeletedFK[$key] = "$key = '{$this->$value}'";
+                                        $notDeletedFK[$key] = $this->$value;
                                     }
                                     $relSave = $relModel->save();
 
                                     if (!$relSave || !empty($relModel->errors)) {
-                                        $relModelWords = Inflector::camel2words(StringHelper::basename($AQ->modelClass));
+                                        $relModelWords = Yii::t('app', Inflector::camel2words(StringHelper::basename($AQ->modelClass)));
                                         $index++;
                                         foreach ($relModel->errors as $validation) {
                                             foreach ($validation as $errorMsg) {
@@ -128,105 +151,113 @@ trait RelationTrait
                                     } else {
                                         //GET PK OF REL MODEL
                                         if ($isManyMany) {
+                                            $mainPK = array_keys($link)[0];
                                             foreach ($relModel->primaryKey as $attr => $value) {
-                                                $notDeletedPK[$i][$attr] = "'$value'";
-                                                $fields[$attr] = "";
+                                                if ($attr != $mainPK) {
+                                                    $notDeletedPK[$attr][] = $value;
+                                                }
                                             }
                                         } else {
-                                            $notDeletedPK[] = "'$relModel->primaryKey'";
+                                            $notDeletedPK[] = $relModel->primaryKey;
                                         }
                                     }
-                                    $i++;
                                 }
                                 if (!$isNewRecord) {
                                     //DELETE WITH 'NOT IN' PK MODEL & REL MODEL
                                     if ($isManyMany) {
-                                        $compiledFields = implode(", ", array_keys($fields));
-                                        $compiledNotDeletedPK = ['and', $notDeletedFK];
-                                        $notIn = ['not in', new \yii\db\Expression("($compiledFields)")];
-                                        foreach ($notDeletedPK as $value) {
-                                            $v = [];
-                                            foreach ($fields as $key => $f) {
-                                                $v[] = $value[$key];
-                                            }
-                                            $c = implode(',', $v);
-                                            $content[] = new \yii\db\Expression("($c)");
+                                        // Many Many
+                                        $query = ['and', $notDeletedFK];
+                                        foreach ($notDeletedPK as $attr => $value) {
+                                            $notIn = ['not in', $attr, $value];
+                                            array_push($query, $notIn);
                                         }
-                                        array_push($notIn, $content);
-                                        array_push($compiledNotDeletedPK, $notIn);
                                         try {
-                                            $relModel->deleteAll($compiledNotDeletedPK);
-                                        } catch (\yii\db\IntegrityException $exc) {
+                                            if ($isSoftDelete) {
+                                                $relModel->updateAll($this->_rt_softdelete, $query);
+                                            } else {
+                                                $relModel->deleteAll($query);
+                                            }
+                                        } catch (IntegrityException $exc) {
                                             $this->addError($name, "Data can't be deleted because it's still used by another data.");
                                             $error = true;
                                         }
                                     } else {
-                                        $notDeletedFK = implode(' AND ', $notDeletedFK);
-                                        $compiledNotDeletedPK = implode(',', $notDeletedPK);
-                                        if (!empty($compiledNotDeletedPK)) {
+                                        // Has Many
+                                        $query = ['and', $notDeletedFK, ['not in', $relPKAttr[0], $notDeletedPK]];
+                                        if (!empty($notDeletedPK)) {
                                             try {
-                                                $relModel->deleteAll($notDeletedFK . ' AND ' . $relPKAttr[0] . " NOT IN ($compiledNotDeletedPK)");
-                                            } catch (\yii\db\IntegrityException $exc) {
+                                                if ($isSoftDelete) {
+                                                    $relModel->updateAll($this->_rt_softdelete, $query);
+                                                } else {
+                                                    $relModel->deleteAll($query);
+                                                }
+                                            } catch (IntegrityException $exc) {
                                                 $this->addError($name, "Data can't be deleted because it's still used by another data.");
                                                 $error = true;
                                             }
                                         }
                                     }
                                 }
-                            } else {
-                                //Has One
-                                foreach ($link as $key => $value) {
-                                    $records->$key = $this->$value;
-                                }
-                                $relSave = $records->save();
-                                if (!$relSave || !empty($records->errors)) {
-                                    $recordsWords = Inflector::camel2words(StringHelper::basename($AQ->modelClass));
-                                    foreach ($records->errors as $validation) {
-                                        foreach ($validation as $errorMsg) {
-                                            $this->addError($name, "$recordsWords : $errorMsg");
-                                        }
+                            }
+                        } else {
+                            //Has One
+                            foreach ($link as $key => $value) {
+                                $records->$key = $this->$value;
+                            }
+                            $relSave = $records->save();
+                            if (!$relSave || !empty($records->errors)) {
+                                $recordsWords = Yii::t('app', Inflector::camel2words(StringHelper::basename($AQ->modelClass)));
+                                foreach ($records->errors as $validation) {
+                                    foreach ($validation as $errorMsg) {
+                                        $this->addError($name, "$recordsWords : $errorMsg");
                                     }
-                                    $error = true;
                                 }
+                                $error = true;
                             }
                         }
                     }
-                }
-                //No Children left
-                $relAvail = array_keys($this->relatedRecords);
-                $relData = $this->getRelationData();
-                $allRel = array_keys($relData);
-                $noChildren = array_diff($allRel, $relAvail);
+                } else {
+                    //No Children left
+                    $relAvail = array_keys($this->relatedRecords);
+                    $relData = $this->getRelationData();
+                    $allRel = array_keys($relData);
+                    $noChildren = array_diff($allRel, $relAvail);
 
-                foreach ($noChildren as $relName) {
-                    if (in_array($relName, $skippedRelations)) {
-                        continue;
-                    }
-                    /* @var $relModel ActiveRecord */
-                    if (empty($relData[$relName]['via'])) {
-                        $relModel = new $relData[$relName]['modelClass'];
-                        $condition = [];
-                        $isManyMany = count($relModel->primaryKey()) > 1;
-                        if ($isManyMany) {
-                            foreach ($relData[$relName]['link'] as $k => $v) {
-                                $condition[] = "$k = '{$this->$v}'";
-                            }
-                            try {
-                                $relModel->deleteAll(implode(" AND ", $condition));
-                            } catch (\yii\db\IntegrityException $exc) {
-                                $this->addError($relData[$relName]['name'], \Yii::t('mtrelt', "Data can't be deleted because it's still used by another data."));
-                                $error = true;
-                            }
-                        } else {
-                            if ($relData[$relName]['ismultiple']) {
+                    foreach ($noChildren as $relName) {
+                        /* @var $relModel ActiveRecord */
+                        if (empty($relData[$relName]['via']) && !in_array($relName, $skippedRelations)) {
+                            $relModel = new $relData[$relName]['modelClass'];
+                            $condition = [];
+                            $isManyMany = count($relModel->primaryKey()) > 1;
+                            if ($isManyMany) {
                                 foreach ($relData[$relName]['link'] as $k => $v) {
-                                    $condition[] = "$k = '{$this->$v}'";
+                                    $condition[$k] = $this->$v;
                                 }
                                 try {
-                                    $relModel->deleteAll(implode(" AND ", $condition));
-                                } catch (\yii\db\IntegrityException $exc) {
-                                    $this->addError($relData[$relName]['name'], \Yii::t('mtrelt', "Data can't be deleted because it's still used by another data."));
+                                    if ($isSoftDelete) {
+                                        $relModel->updateAll($this->_rt_softdelete, ['and', $condition]);
+                                    } else {
+                                        $relModel->deleteAll(['and', $condition]);
+                                    }
+                                } catch (IntegrityException $exc) {
+                                    $this->addError($relData[$relName]['name'], Yii::t('mtrelt', "Data can't be deleted because it's still used by another data."));
                                     $error = true;
+                                }
+                            } else {
+                                if ($relData[$relName]['ismultiple']) {
+                                    foreach ($relData[$relName]['link'] as $k => $v) {
+                                        $condition[$k] = $this->$v;
+                                    }
+                                    try {
+                                        if ($isSoftDelete) {
+                                            $relModel->updateAll($this->_rt_softdelete, ['and', $condition]);
+                                        } else {
+                                            $relModel->deleteAll(['and', $condition]);
+                                        }
+                                    } catch (IntegrityException $exc) {
+                                        $this->addError($relData[$relName]['name'], Yii::t('mtrelt', "Data can't be deleted because it's still used by another data."));
+                                        $error = true;
+                                    }
                                 }
                             }
                         }
@@ -250,26 +281,30 @@ trait RelationTrait
         }
     }
 
-    public function deleteWithRelated()
+    public function deleteWithRelated($skippedRelations = [])
     {
         /* @var $this ActiveRecord */
         $db = $this->getDb();
         $trans = $db->beginTransaction();
+        $isSoftDelete = isset($this->_rt_softdelete);
         try {
             $error = false;
             $relData = $this->getRelationData();
             foreach ($relData as $data) {
-                if ($data['ismultiple']) {
+                $array = [];
+                if ($data['ismultiple'] && !in_array($data['name'], $skippedRelations)) {
                     $link = $data['link'];
                     if (count($this->{$data['name']})) {
-                        $relPKAttr = $this->{$data['name']}[0]->primaryKey();
-//                        $isCompositePK = (count($relPKAttr) > 1); // unused
                         foreach ($link as $key => $value) {
                             if (isset($this->$value)) {
-                                $array[$key] = "$key = '{$this->$value}'";
+                                $array[$key] = $this->$value;
                             }
                         }
-                        $error = !$this->{$data['name']}[0]->deleteAll(implode(' AND ', $array));
+                        if ($isSoftDelete) {
+                            $error = !$this->{$data['name']}[0]->updateAll($this->_rt_softdelete, ['and', $array]);
+                        } else {
+                            $error = !$this->{$data['name']}[0]->deleteAll(['and', $array]);
+                        }
                     }
                 }
             }
@@ -277,69 +312,122 @@ trait RelationTrait
                 $trans->rollback();
                 return false;
             }
-            if ($this->delete()) {
-                $trans->commit();
-                return true;
+            if ($isSoftDelete) {
+                $this->attributes = array_merge($this->attributes, $this->_rt_softdelete);
+                if ($this->save(false)) {
+                    $trans->commit();
+                    return true;
+                } else {
+                    $trans->rollBack();
+                }
+            } else {
+                if ($this->delete()) {
+                    $trans->commit();
+                    return true;
+                } else {
+                    $trans->rollBack();
+                }
             }
-            $trans->rollBack();
         } catch (Exception $exc) {
             $trans->rollBack();
             throw $exc;
         }
     }
 
+    public function restoreWithRelated($skippedRelations = [])
+    {
+        if (!isset($this->_rt_softrestore)) {
+            return false;
+        }
+
+        /* @var $this ActiveRecord */
+        $db = $this->getDb();
+        $trans = $db->beginTransaction();
+        try {
+            $error = false;
+            $relData = $this->getRelationData();
+            foreach ($relData as $data) {
+                $array = [];
+                if ($data['ismultiple'] && !in_array($data['name'], $skippedRelations)) {
+                    $link = $data['link'];
+                    if (count($this->{$data['name']})) {
+                        foreach ($link as $key => $value) {
+                            if (isset($this->$value)) {
+                                $array[$key] = $this->$value;
+                            }
+                        }
+                        $error = !$this->{$data['name']}[0]->updateAll($this->_rt_softrestore, ['and', $array]);
+                    }
+                }
+            }
+            if ($error) {
+                $trans->rollback();
+                return false;
+            }
+            $this->attributes = array_merge($this->attributes, $this->_rt_softrestore);
+            if ($this->save(false)) {
+                $trans->commit();
+                return true;
+            } else {
+                $trans->rollBack();
+            }
+        } catch (Exception $exc) {
+            $trans->rollBack();
+            throw $exc;
+        }
+    }
+
+//    abstract protected function relationNames();
 
     public function getRelationData()
     {
-        $ARMethods = get_class_methods('\yii\db\ActiveRecord');
-        $modelMethods = get_class_methods('\yii\base\Model');
-        $reflection = new \ReflectionClass($this);
         $stack = [];
-        /* @var $method \ReflectionMethod */
-        foreach ($reflection->getMethods() as $method) {
-            if (in_array($method->name, $ARMethods) || in_array($method->name, $modelMethods)) {
-                continue;
+        if (method_exists($this, 'relationNames')) {
+            foreach ($this->relationNames() as $name) {
+                /* @var $rel ActiveQuery */
+                $rel = $this->getRelation($name);
+                $stack[$name]['name'] = $name;
+                $stack[$name]['method'] = 'get' . ucfirst($name);
+                $stack[$name]['ismultiple'] = $rel->multiple;
+                $stack[$name]['modelClass'] = $rel->modelClass;
+                $stack[$name]['link'] = $rel->link;
+                $stack[$name]['via'] = $rel->via;
             }
-            if ($method->name === 'bindModels') {
-                continue;
-            }
-            if ($method->name === 'attachBehaviorInternal') {
-                continue;
-            }
-            if ($method->name === 'loadAll') {
-                continue;
-            }
-            if ($method->name === 'saveAll') {
-                continue;
-            }
-            if ($method->name === 'getRelationData') {
-                continue;
-            }
-            if ($method->name === 'getAttributesWithRelatedAsPost') {
-                continue;
-            }
-            if ($method->name === 'getAttributesWithRelated') {
-                continue;
-            }
-            if ($method->name === 'deleteWithRelated') {
-                continue;
-            }
-            if (strpos($method->name, 'get') === false) {
-                continue;
-            }
-            try {
-                $rel = call_user_func(array($this, $method->name));
-                if ($rel instanceof \yii\db\ActiveQuery) {
-                    $name = lcfirst(str_replace('get', '', $method->name));
-                    $stack[$name]['name'] = lcfirst(str_replace('get', '', $method->name));
-                    $stack[$name]['method'] = $method->name;
-                    $stack[$name]['ismultiple'] = $rel->multiple;
-                    $stack[$name]['modelClass'] = $rel->modelClass;
-                    $stack[$name]['link'] = $rel->link;
-                    $stack[$name]['via'] = $rel->via;
+        } else {
+            $ARMethods = get_class_methods('\yii\db\ActiveRecord');
+            $modelMethods = get_class_methods('\yii\base\Model');
+            $reflection = new \ReflectionClass($this);
+            /* @var $method \ReflectionMethod */
+            foreach ($reflection->getMethods() as $method) {
+                if (in_array($method->name, $ARMethods) || in_array($method->name, $modelMethods)) {
+                    continue;
                 }
-            } catch (\yii\base\ErrorException $exc) {
-                //if method name can't be called,
+                if ($method->name === 'getRelationData') {
+                    continue;
+                }
+                if ($method->name === 'getAttributesWithRelatedAsPost') {
+                    continue;
+                }
+                if ($method->name === 'getAttributesWithRelated') {
+                    continue;
+                }
+                if (strpos($method->name, 'get') !== 0) {
+                    continue;
+                }
+                try {
+                    $rel = call_user_func(array($this, $method->name));
+                    if ($rel instanceof ActiveQuery) {
+                        $name = lcfirst(preg_replace('/^get/', '', $method->name));
+                        $stack[$name]['name'] = lcfirst(preg_replace('/^get/', '', $method->name));
+                        $stack[$name]['method'] = $method->name;
+                        $stack[$name]['ismultiple'] = $rel->multiple;
+                        $stack[$name]['modelClass'] = $rel->modelClass;
+                        $stack[$name]['link'] = $rel->link;
+                        $stack[$name]['via'] = $rel->via;
+                    }
+                } catch (ErrorException $exc) {
+                    //if method name can't be called,
+                }
             }
         }
         return $stack;
@@ -368,6 +456,7 @@ trait RelationTrait
 
     public function getAttributesWithRelated()
     {
+        /* @var $this ActiveRecord */
         $return = $this->attributes;
         foreach ($this->relatedRecords as $name => $records) {
             $AQ = $this->getRelation($name);
@@ -380,5 +469,37 @@ trait RelationTrait
             }
         }
         return $return;
+    }
+
+    /**
+     * TranslationTrait manages methods for all translations used in Krajee extensions
+     *
+     * @property array $i18n
+     *
+     * @author Kartik Visweswaran <kartikv2@gmail.com>
+     * @since 1.8.8
+     * Yii i18n messages configuration for generating translations
+     * source : https://github.com/kartik-v/yii2-krajee-base/blob/master/TranslationTrait.php
+     * Edited by : Yohanes Candrajaya <moo.tensai@gmail.com>
+     *
+     *
+     * @return void
+     */
+    public function initI18N()
+    {
+        $reflector = new \ReflectionClass(get_class($this));
+        $dir = dirname($reflector->getFileName());
+
+        Yii::setAlias("@mtrelt", $dir);
+        $config = [
+            'class' => 'yii\i18n\PhpMessageSource',
+            'basePath' => "@mtrelt/messages",
+            'forceTranslation' => true
+        ];
+        $globalConfig = ArrayHelper::getValue(Yii::$app->i18n->translations, "mtrelt*", []);
+        if (!empty($globalConfig)) {
+            $config = array_merge($config, is_array($globalConfig) ? $globalConfig : (array)$globalConfig);
+        }
+        Yii::$app->i18n->translations["mtrelt*"] = $config;
     }
 }
